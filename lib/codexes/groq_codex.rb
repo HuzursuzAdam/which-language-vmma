@@ -8,18 +8,18 @@ require 'time'
 require 'fileutils'
 require 'openssl'
 
-# Groq API adapter (OpenAI Compatible) - Production Grade
+# Groq API adapter (OpenAI Compatible) - Multi-Language Production Grade
 class GroqCodex < BaseCodex
   API_URL = 'https://api.groq.com/openai/v1/chat/completions'
 
   # Groq Llama 3.3 70B Pricing (March 2026)
-  PRICE_INPUT_1M = 0.59
-  PRICE_OUTPUT_1M = 0.79
+  PRICE_INPUT_1M = 0.08
+  PRICE_OUTPUT_1M = 0.24
 
   def initialize(config = {})
     super('groq', config)
     @api_key = config[:api_key] || ENV['GROQ_API_KEY']
-    @model_name = config[:model] || config[:model_name] || 'llama-3.3-70b-versatile'
+    @model_name = config[:model] || config[:model_name] || 'moonshotai/kimi-k2-instruct-0905'
     @cooldown_seconds = config[:cooldown_seconds] || 1.5
 
     raise CodexError, 'GROQ_API_KEY not configured' unless @api_key
@@ -91,12 +91,11 @@ class GroqCodex < BaseCodex
   def call_groq_api(prompt)
     uri = URI.parse(API_URL)
     
-    # SYSTEM PROMPT INJECTION: Forcing the model to focus only on code generation
     system_instruction = <<~TEXT
       You are a senior software engineer. 
       Respond ONLY with the source code. 
       Do not include any conversational text, explanations, or notes.
-      Always wrap your code in triple backticks with the correct language identifier (e.g., ```python).
+      Always wrap your code in triple backticks with the correct language identifier (e.g., ```c, ```ocaml, ```scheme).
     TEXT
 
     request_body = {
@@ -145,7 +144,6 @@ class GroqCodex < BaseCodex
     blocks = extract_code_blocks(response_text, binary_name)
     written_files = []
 
-    # 1. Write blocks with identified filenames (e.g., Makefile)
     blocks.select { |block| block[:filename] }.each do |block|
       path = File.join(dir, block[:filename])
       FileUtils.mkdir_p(File.dirname(path))
@@ -153,7 +151,6 @@ class GroqCodex < BaseCodex
       written_files << block[:filename]
     end
 
-    # 2. Select the primary code block and write to the target file
     primary_block = choose_primary_block(blocks, lang)
     if primary_block
       target = primary_target_for(lang, binary_name: binary_name)
@@ -162,11 +159,9 @@ class GroqCodex < BaseCodex
         File.write(File.join(dir, target), code)
         written_files << target
       end
-    # FALLBACK: If no markdown blocks were captured but response is substantial,
-    # clean the response and treat it as code (prevents LOC 1 issues).
-    elsif written_files.empty? && response_text.length > 200
+    elsif written_files.empty? && response_text.length > 100
       target = primary_target_for(lang, binary_name: binary_name) || binary_name
-      clean_code = response_text.gsub(/```[a-z]*|```/, '').strip
+      clean_code = response_text.gsub(/```[a-z0-9_+-]*|```/i, '').strip
       code = normalize_script_for_target(clean_code, lang, target, binary_name: binary_name)
       File.write(File.join(dir, target), code)
       written_files << target
@@ -174,8 +169,7 @@ class GroqCodex < BaseCodex
 
     ensure_runtime_files(lang, dir, written_files, binary_name: binary_name)
     
-    # Set executable permissions
-    [binary_name, 'build.sh'].each do |f|
+    [binary_name, 'build.sh', 'Makefile'].each do |f|
       path = File.join(dir, f)
       FileUtils.chmod(0755, path) if File.exist?(path)
     end
@@ -183,7 +177,6 @@ class GroqCodex < BaseCodex
 
   def extract_code_blocks(response_text, binary_name)
     blocks = []
-    # Flexible Regex: Handles leading whitespace, varied sat-ends (\r\n), and nameless blocks
     response_text.to_enum(:scan, /```[ \t]*(?<lang>[A-Za-z0-9_+-]*)[ \t]*\r?\n(?<code>.*?)```/m).each do
       match = Regexp.last_match
       context = response_text[[match.begin(0) - 400, 0].max...match.begin(0)]
@@ -199,7 +192,7 @@ class GroqCodex < BaseCodex
   def infer_filename_from_context(context, binary_name)
     binary_pattern = Regexp.escape(binary_name)
     backticked = context.scan(/`([^`\n]+)`/).flatten.reverse.find do |token|
-      token.match?(/\A(?:#{binary_pattern}|Makefile|makefile|build\.sh|[\w.\/-]+\.(?:rb|py|go|rs|c|h|ts|js|java|pl|lua|scm|ml|hs))\z/)
+      token.match?(/\A(?:#{binary_pattern}|Makefile|makefile|build\.sh|[\w.\/-]+\.(?:rb|py|go|rs|c|h|ts|js|java|pl|lua|scm|ml|hs|java|pl|pm|sh|php|cs|cpp|hpp))\z/)
     end
     return backticked if backticked
     context[/file named\s+[`"]?([A-Za-z0-9._\/-]+)[`"]?/i, 1]
@@ -207,22 +200,59 @@ class GroqCodex < BaseCodex
 
   def choose_primary_block(blocks, lang)
     return nil if blocks.empty?
+    # 15 Dil için genişletilmiş mapping
     expected = { 
-      'python' => %w[python py], 'ruby' => %w[ruby rb], 
-      'go' => %w[go], 'rust' => %w[rust rs], 'c' => %w[c] 
-    }.fetch(lang, [])
-    # Find block for the expected language, otherwise fallback to the longest code block
+      'python' => %w[python py], 
+      'ruby' => %w[ruby rb], 
+      'go' => %w[go], 
+      'rust' => %w[rust rs], 
+      'c' => %w[c cpp],
+      'lua' => %w[lua],
+      'scheme' => %w[scheme scm lisp racket],
+      'ocaml' => %w[ocaml ml],
+      'haskell' => %w[haskell hs],
+      'perl' => %w[perl pl pm],
+      'java' => %w[java],
+      'javascript' => %w[javascript js],
+      'typescript' => %w[typescript ts],
+      'php' => %w[php],
+      'csharp' => %w[csharp cs]
+    }.fetch(lang, [lang])
+    
     blocks.find { |b| expected.include?(b[:fence_lang]) } || blocks.max_by { |b| b[:code].length }
   end
 
   def primary_target_for(lang, binary_name: 'minigit')
-    { 'python' => binary_name, 'ruby' => binary_name, 'go' => 'main.go', 'rust' => 'main.rs', 'c' => 'main.c' }[lang]
+    targets = { 
+      'python' => binary_name, 
+      'ruby' => binary_name, 
+      'go' => 'main.go', 
+      'rust' => 'main.rs', 
+      'c' => 'main.c',
+      'lua' => 'main.lua',
+      'scheme' => 'main.scm',
+      'ocaml' => 'main.ml',
+      'haskell' => 'main.hs',
+      'perl' => 'main.pl',
+      'java' => 'Main.java',
+      'javascript' => 'main.js',
+      'typescript' => 'main.ts',
+      'php' => 'main.php',
+      'csharp' => 'Program.cs'
+    }
+    targets[lang] || "#{binary_name}.#{lang}"
   end
 
   def normalize_script_for_target(code, lang, target, binary_name: 'minigit')
     return code if code.start_with?('#!')
-    shebang = { 'python' => '#!/usr/bin/env python3', 'ruby' => '#!/usr/bin/env ruby' }[lang]
-    shebang ? "#{shebang}\n#{code}\n" : code
+    shebangs = { 
+      'python' => '#!/usr/bin/env python3', 
+      'ruby' => '#!/usr/bin/env ruby',
+      'perl' => '#!/usr/bin/env perl',
+      'lua' => '#!/usr/bin/env lua',
+      'javascript' => '#!/usr/bin/env node'
+    }
+    shebangs[lang] ? "#{shebangs[lang]}\n#{code}\n" : code
   end
 
   def ensure_runtime_files(lang, dir, written_files, binary_name: 'minigit')
@@ -230,19 +260,20 @@ class GroqCodex < BaseCodex
     when 'go' then write_if_missing(dir, 'build.sh', "#!/usr/bin/env bash\ngo build -o #{binary_name} main.go\n", written_files)
     when 'rust' then write_if_missing(dir, 'build.sh', "#!/usr/bin/env bash\nrustc -O main.rs -o #{binary_name}\n", written_files)
     when 'c' then write_if_missing(dir, 'build.sh', "#!/usr/bin/env bash\ngcc -O2 -o #{binary_name} main.c\n", written_files)
+    when 'ocaml' then write_if_missing(dir, 'build.sh', "#!/usr/bin/env bash\nocamlopt -o #{binary_name} main.ml\n", written_files)
+    when 'haskell' then write_if_missing(dir, 'build.sh', "#!/usr/bin/env bash\nghc -O2 -o #{binary_name} main.hs\n", written_files)
+    when 'java' then write_if_missing(dir, 'build.sh', "#!/usr/bin/env bash\njavac Main.java\n", written_files)
     end
   end
 
   def read_benchmark_value(dir, filename)
     path = File.join(dir, filename)
     File.file?(path) ? File.read(path, encoding: 'UTF-8').strip : nil
-  rescue StandardError
-    nil
-  end
+  rescue StandardError; nil; end
 
   def infer_language_from_dir(dir)
     dir_name = File.basename(dir)
-    dir_name[/-(rust|go|c|typescript|javascript|java|perl|python|ruby|lua|scheme|ocaml|haskell)-\d+-v[12]$/, 1] || 'python'
+    dir_name[/-(rust|go|c|typescript|javascript|java|perl|python|ruby|lua|scheme|ocaml|haskell|php|csharp)-\d+-v[12]$/, 1] || 'python'
   end
 
   def write_if_missing(dir, rel_path, content, written)
