@@ -92,7 +92,7 @@ class AiderCodex < BaseCodex
       chmod_if_present(File.join(dir, binary_name))
       chmod_if_present(File.join(dir, 'build.sh'))
 
-      log_execution(log_path, prompt, result, metrics, lang, source_file) if log_path
+      log_execution(log_path, prompt, metrics, {}, raw_output) if log_path
 
       # Success check: exit code or file growth
       success = result[:success] || (File.exist?(source_path) && File.size(source_path) > 20)
@@ -151,27 +151,6 @@ class AiderCodex < BaseCodex
     return 0 if str.nil?
     num_str = str.delete(',').downcase
     num_str.include?('k') ? (num_str.to_f * 1000).to_i : num_str.to_i
-  end
-
-  def log_execution(path, prompt, result, metrics, lang, source_file)
-    FileUtils.mkdir_p(File.dirname(path))
-    log_data = {
-      model: @model,
-      lang: lang,
-      source_file: source_file,
-      prompt: prompt,
-      success: result[:success],
-      stdout: result[:stdout],
-      stderr: result[:stderr],
-      metrics: metrics,
-      timestamp: Time.now.iso8601
-    }
-    File.write(path, JSON.pretty_generate(log_data))
-  end
-
-  def handle_error(e, start_time)
-    elapsed = Time.now - start_time rescue 0.0
-    { success: false, elapsed_seconds: elapsed.round(1), metrics: nil, error: e.message }
   end
 
   # --- File & Language Helpers ---
